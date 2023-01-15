@@ -1,7 +1,3 @@
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE ImpredicativeTypes #-}
-
 module Main where
 
 import Control.Applicative (Alternative, Applicative(liftA2))
@@ -17,13 +13,14 @@ import Control.Monad.Trans.Maybe (MaybeT, runMaybeT)
 import Data.Char (ord)
 import Data.Function (on)
 import Data.Functor ((<&>))
-import Data.List (foldl', nub, singleton)
-import Data.List.NonEmpty (NonEmpty((:|)), (<|), fromList, take)
+import Data.List (foldl', nub, singleton, transpose)
+import Data.List.NonEmpty (NonEmpty((:|)), (<|), fromList, tail, take, toList)
 import Data.Set (member)
 import Data.Set as Set (fromList, member)
 import Data.Text (Text, pack)
 import Data.Void (Void)
 import GHC.Char (chr)
+import GHC.Plugins (isSingleton)
 import GHC.Utils.Misc (lengthExceeds)
 import Text.Megaparsec
   ( MonadParsec(lookAhead, try)
@@ -54,7 +51,9 @@ main = do
   -- parseTest (regex <* eof) $ pack line
   regex <- maybeToM "Failed!" (parseMaybe (regex <* eof) $ pack line)
   putStrLn "Succeeded!\nPossible Matches:"
-  putStrLn (regexTargettedExpander 10 regex >>= (('"' :) . (++ "\", ")))
+  putStrLn
+    (init . init $
+     regexTargettedExpander Recurse 10 regex >>= (('"' :) . (++ "\", ")))
 
 maybeToM :: Monad m => [Char] -> Maybe a -> m a
 maybeToM errMsg Nothing = error errMsg
@@ -109,14 +108,12 @@ postfixOperators :: Parser (Regex -> Regex)
 postfixOperators =
   Repetition <$ token (char '*') <|> nonZeroRep <$ token (char '+') <|>
   optionalReg <$ token (char '?') <|>
-  Concatenation <$> regex
+  flip Concatenation <$> regex
 
 table :: [[Operator Parser Regex]]
 table =
   [ [Postfix $ manyPostfixUnaryOp postfixOperators]
-  , [ InfixL (flatAlternation <$ token (char '|'))
-    -- , InfixL (Concatenation <$ try space1)
-    ]
+  , [InfixL (flatAlternation <$ token (char '|'))]
   ]
 
 -- Converts a parser to one that consumes all spaces  before it before trying to
@@ -174,27 +171,59 @@ converge p (x:ys@(y:_))
   | p x y = x
   | otherwise = converge p ys
 
-regexTargettedExpander :: Int -> Regex -> [String]
-regexTargettedExpander n r =
+regexTargettedExpander :: AltStrategy -> Int -> Regex -> [String]
+regexTargettedExpander as n r =
   Prelude.take n $
   snd $
   converge
     (\(l1, l1') (l2, _) -> lengthExceeds l1' n || l1 == l2)
-    (fmap (\x -> (length x, x)) (regexExpander r))
+    (fmap (\x -> (length x, x)) (regexExpander as r))
 
--- Inefficient use of nub here, ideally should swap for some better duplicate
--- removal function, but needs to still be lazy
-regexExpander :: Regex -> [[String]]
-regexExpander regex = fmap (nub . (`regexExpander'` regex)) nats
+-- nub is innefficient here. Ideally should use some more efficient approach to
+-- removedduplicates, but it needs to still be lazy.
+regexExpander :: AltStrategy -> Regex -> [[String]]
+regexExpander as regex = fmap (nub . flip (regexExpander' as) regex) nats
 
 repeatList :: [a] -> Int -> [a]
 repeatList l n = concat $ replicate n l
 
-regexExpander' :: Int -> Regex -> [String]
-regexExpander' n (FlatAlternation os) =
-  Data.List.NonEmpty.take (n + 1) os >>= regexExpander' n
-regexExpander' n (Concatenation r1 r2) =
-  [a ++ b | a <- regexExpander' n r1, b <- regexExpander' n r2]
-regexExpander' n (Repetition r) =
-  [0 .. n] >>= (\i -> fmap (`repeatList` i) (regexExpander' n r))
-regexExpander' n (Literal s) = [s]
+addParens :: String -> String
+addParens = ('(' :) . (++ ")")
+
+listLimit :: Int
+listLimit = 3
+
+applyIf :: (a -> a) -> Bool -> a -> a
+applyIf f True = f
+applyIf _ False = id
+
+-- Current conclusions on "List" mode:
+-- It works, but honestly isn't very clear
+-- I think keeping "?" would be preferable to sometimes having (|a)
+-- But nesting of choices is also a problem
+-- Will have to think if there is a smarter way to represent
+regexExpander' :: AltStrategy -> Int -> Regex -> [String]
+regexExpander' Recurse n (FlatAlternation os) =
+  Data.List.NonEmpty.take (n + 1) os >>= regexExpander' Recurse n
+regexExpander' List n (FlatAlternation os) = tmp4
+  where
+    tmp1 = Data.List.NonEmpty.take listLimit os
+    ellipses = lengthExceeds (Data.List.NonEmpty.tail os) $ listLimit - 1
+    tmp2 = fmap (regexExpander' List n) tmp1
+    tmp3 = transpose tmp2
+    addEllipses = applyIf (++ "|..") ellipses
+    tmp4 =
+      fmap
+        (\l ->
+           applyIf addParens (not $ isSingleton l) $
+           addEllipses $ init (l >>= (++ "|")))
+        tmp3
+regexExpander' as n (Concatenation r1 r2) =
+  [a ++ b | a <- regexExpander' as n r1, b <- regexExpander' as n r2]
+regexExpander' as n (Repetition r) =
+  [0 .. n] >>= (\i -> fmap (`repeatList` i) (regexExpander' as n r))
+regexExpander' _ n (Literal s) = [s]
+
+data AltStrategy
+  = Recurse
+  | List
