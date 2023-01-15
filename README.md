@@ -1,6 +1,6 @@
 # Simple Regex Expander
 
-I found myself wanting some tool to, given some Regex, return a list of
+I found myself wanting some tool to, given some Regex, print out a list of
 potential matching strings (i.e: to quickly see if there are false-positives).
 
 After a bit of Google searching, I surprisingly couldn't find anything, so I
